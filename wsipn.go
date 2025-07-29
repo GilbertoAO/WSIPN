@@ -194,10 +194,34 @@ func main() {
 		}
 	}
 
-	if err := listGames(steamID64, apiKey); err != nil {
-		log.Fatalf("Error: %v", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		games, err := listGames(ctx, steamID64, apiKey)
+		if err != nil {
+			log.Fatalf("Error listing games: %v", err)
+		}
+
+		unplayed := unplayedGames(games, 120) // 2 hours threshold
+		randomGame, err := getRandomUnplayedGame(unplayed)
+		if err != nil {
+			log.Printf("Couldn't pick a random unplayed game: %v", err)
+		}
+		leastPlayed, err := getLeastPlayedGame(games)
+		if err != nil {
+			log.Printf("Couldn't find least played game: %v", err)
+		}
+
+		fmt.Printf("== Welcome to WSPIN 1.0 ==\n")
+		fmt.Printf("Total games: %d, Unplayed (<2h) games: %d\n", len(games), len(unplayed))
+
+		if len(unplayed) > 0 {
+			fmt.Printf("\n== Random Unplayed Game ==\n%s\n", randomGame.Name)
+		}
+		if leastPlayed.Name != "" {
+			fmt.Printf("\n== Least Played Game ==\n%s (%d minutes)\n", leastPlayed.Name, leastPlayed.PlaytimeForever)
+		}
 	}
-}
 
 // performOpenIDLogin initiates the OpenID login process with Steam.
 // Arguments:
@@ -272,57 +296,73 @@ func performOpenIDLogin() (string, error) {
 //   - steamID64: The user's SteamID64.
 //   - apiKey: The Steam API key to authenticate the request.
 // Returns an error if the API request fails or if the response is invalid.
-func listGames(steamID64, apiKey string) error {
+
+// listGames fetches and returns all games (sorted alphabetically). It does NOT print anything.
+func listGames(ctx context.Context, steamID64, apiKey string) ([]Game, error) {
 	apiURL := fmt.Sprintf(
 		"https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/?key=%s&steamid=%s&include_appinfo=1&include_played_free_games=1",
 		apiKey, steamID64,
 	)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
+		return nil, fmt.Errorf("creating request: %w", err)
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("fetching games: %w", err)
+		return nil, fmt.Errorf("fetching games: %w", err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("steam API returned status %d", resp.StatusCode)
+	}
+
 	var apiResp APIResponse
 	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
-		return fmt.Errorf("invalid response from Steam API: %w", err)
+		return nil, fmt.Errorf("invalid response from Steam API: %w", err)
 	}
-	if len(apiResp.Response.Games) == 0 {
-		fmt.Println("No games found.")
-		return nil
-	}
+
 	games := apiResp.Response.Games
 	sort.Slice(games, func(i, j int) bool {
 		return games[i].Name < games[j].Name
 	})
+	return games, nil
+}
 
-	unplayedGames := make([]string, 0)
-	for _, game := range games {
-		if game.PlaytimeForever == 0 {
-			unplayedGames = append(unplayedGames, game.Name)
+// unplayedGames returns all games with playtime < thresholdMinutes (e.g., < 120 = < 2h).
+func unplayedGames(games []Game, thresholdMinutes int) []Game {
+	out := make([]Game, 0, len(games))
+	for _, g := range games {
+		if g.PlaytimeForever < thresholdMinutes {
+			out = append(out, g)
 		}
 	}
+	return out
+}
 
-	fmt.Printf("== Welcome to WSIPN 1.0 ==\n")
-	fmt.Printf("Total games: %d, Unplayed games: %d\n", len(games), len(unplayedGames))
-	fmt.Printf("No playtime recorded for these games:\n")
-	for _, name := range unplayedGames {
-		fmt.Printf("%s\n", name)
+// getRandomUnplayedGame returns a random game from the given slice.
+func getRandomUnplayedGame(unplayed []Game) (Game, error) {
+	if len(unplayed) == 0 {
+		return Game{}, errors.New("no unplayed games")
 	}
-
 	rand.Seed(time.Now().UnixNano())
-	randomIndex := rand.Intn(len(unplayedGames))
-	fmt.Printf("\n== Random Game Selection ==\n")
-	fmt.Printf("Randomly selected game to play: %s\n", unplayedGames[randomIndex])
-	return nil
+	return unplayed[rand.Intn(len(unplayed))], nil
+}
+
+// getLeastPlayedGame returns the least played game overall.
+// If there are no games, returns an error.
+func getLeastPlayedGame(games []Game) (Game, error) {
+	if len(games) == 0 {
+		return Game{}, errors.New("no games")
+	}
+	min := games[0]
+	for _, g := range games[1:] {
+		if g.PlaytimeForever < min.PlaytimeForever {
+			min = g
+		}
+	}
+	return min, nil
 }
 // Note: The above code assumes that the .env file is properly set up with the STEAM_API_KEY.
